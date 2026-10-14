@@ -1,0 +1,227 @@
+---
+name: java-spring-task-review
+description: "Reviews the code changes made for a task in a Java 21 / Spring Boot 3.5 project, working from the local git diff of the task branch against its base branch. Checks that the change does what the task asks, hunts for real defects (correctness, transactions and data, API and migration compatibility, security, concurrency, tests), checks that names and comments are accurate and not stale, and returns a prioritized report with file:line evidence and concrete fixes. Use it whenever the user asks to review a task, ticket, branch, commit, diff, MR/PR or 'my changes' in a Java/Spring codebase, asks whether a branch is ready to merge, or says things like 'сделай ревью задачи', 'проверь ветку', 'посмотри изменения перед мержем', even if the word 'review' is never used."
+---
+
+# Task review for Java 21 / Spring Boot 3.5
+
+A review is worth reading when it tells the author something true that they did not
+already know, about a problem that matters, with enough detail to act on it. Every step
+below serves that: understand what the task was, read enough code to be right, and
+report a short list of findings with evidence instead of a long list of guesses.
+
+## Ground rules
+
+- **Read-only.** Do not edit, format, commit, stash, checkout, reset or clean. The
+  working tree may hold the author's uncommitted work. When you see a fix, describe it
+  (a short snippet is fine) and leave applying it to the author, unless asked otherwise.
+- **Project conventions outrank this skill.** Read `AGENTS.md`, `CONTRIBUTING*`,
+  `README*`, checkstyle/spotless/editorconfig settings if present, and look at
+  neighbouring code. If the codebase consistently does something one way, that is the
+  standard here; report it only when it causes an actual defect.
+- **Review the change, not the codebase.** Old problems in touched files are out of
+  scope unless the change makes them worse or they break the task. If you mention one,
+  label it "pre-existing" so the author is not blamed for it.
+- **No finding without evidence.** Each finding points at a file and line and explains
+  what goes wrong. If you cannot show it in the code, it is a question, not a finding.
+
+## Workflow
+
+### 1. Find out what the task is
+
+You need the task description and its acceptance criteria; without them you can only
+check that the code is tidy, not that it is right. Look, in this order: the user's
+message, a file or ticket text they point to, the branch name and commit messages.
+
+If the task text is missing, ask the user for it once. If they cannot provide it or
+you are running unattended, reconstruct the intent from commits and code, and say
+plainly in the report that conformance was judged against a reconstructed intent.
+
+### 2. Collect context
+
+From inside the repository, run the bundled script (the path is relative to this
+skill's directory):
+
+```bash
+bash scripts/collect_context.sh            # base branch is auto-detected
+bash scripts/collect_context.sh develop    # or name the base explicitly
+```
+
+It only runs read-only git commands and prints: the base branch and merge-base, the
+commits, uncommitted and untracked files, the changed-file list, Java / Spring Boot
+versions and build tool, which reference files apply, a list of grep hits worth a
+look, and the names the change removed or renamed that are still mentioned somewhere
+(candidates for stale comments and docs). Treat all of it as places to look, never
+as findings.
+
+No bash available? Do the same by hand:
+
+```bash
+git merge-base <base> HEAD                    # -> MB
+git log --oneline --no-merges MB..HEAD
+git diff --stat -M MB                         # compares MB with the working tree
+git status --short                            # untracked files are NOT in git diff
+```
+
+Sanity-check the result. If the base looks wrong (hundreds of commits, files unrelated
+to the task), ask which branch the task was cut from. Confirm the project really is on
+Java 21 and Boot 3.5.x; if it is not, say so in the report and treat the
+version-specific notes in the references with care.
+
+### 3. Read the change, then read around it
+
+A diff shows what changed, not whether it is correct. Most real defects live in the
+interaction between new code and code that did not change.
+
+- Read the full diff (`git diff <merge-base>`), then open untracked files directly.
+- Open every changed production file in full, not just its hunks.
+- Follow the change outward as far as needed to judge it: callers of methods whose
+  signature or behaviour changed, other implementations of a changed interface, the
+  entity behind a repository, the migration behind an entity, the configuration that
+  feeds a bean, the consumers of a changed DTO or message, and the tests.
+- For a large change (roughly over 1,000 changed lines), go in order of risk:
+  migrations, security configuration, transaction boundaries, public API and DTOs,
+  concurrency and messaging, then the rest. Say in the report what you only skimmed,
+  and suggest how the change could be split.
+
+### 4. Trace requirements to code
+
+For each acceptance criterion, find the code that implements it and the test that
+proves it. This step finds the most expensive class of problem: code that works but
+does the wrong thing, or does only part of it.
+
+- Not implemented, or only the happy path: a finding, usually a blocker.
+- Implemented but untested: a finding about tests.
+- Changes that no criterion asks for (drive-by refactoring, unrelated fixes): list
+  them under "Вне задачи". They are not necessarily wrong, but they widen the risk and
+  the author should confirm they are intentional.
+- Ambiguous requirement where the code picks one reading: a question to the author.
+
+### 5. Look for defects
+
+Go through the passes below in order; earlier passes matter more. Load reference files
+as the change calls for them. They list failure modes specific to this stack, each
+with the reason it bites. They are prompts for where to look, not rules to enforce.
+
+| Reference | Load when |
+|---|---|
+| `references/java21.md` | any `.java` file changed |
+| `references/spring.md` | beans, configuration, controllers, HTTP clients, `@Transactional`, `@Async`, `@Scheduled`, caching, or build files changed |
+| `references/testing.md` | always (tests changed, or should have been) |
+| `references/naming-and-comments.md` | always (pass 7) |
+| `references/persistence.md` | entities, repositories, SQL/JPQL, JDBC, or migrations changed |
+| `references/messaging.md` | Kafka / RabbitMQ producers, listeners or message payloads changed |
+| `references/security.md` | security configuration, new or changed endpoints, auth, input handling, secrets or actuator settings changed |
+| `references/reactive.md` | code returns or consumes `Mono` / `Flux`, or uses `WebClient` |
+
+Passes:
+
+1. **Correctness.** Walk the main path and then the unhappy ones: null and empty
+   input, boundaries, duplicates, a second concurrent request, a retry of the same
+   request, a failure halfway through. Check that error paths leave data consistent.
+2. **Data and transactions.** Where does the transaction start and end, what is inside
+   it that should not be (remote calls, message sends), what happens on rollback.
+3. **Compatibility and rollout.** Can the new version run next to the old one during a
+   rolling deploy? Look at REST and message contracts, database migrations,
+   configuration keys, serialized or cached objects, and feature-flag defaults.
+4. **Security.** Who can call the new code, with what data, and what can they reach.
+5. **Tests.** Do they fail if the logic is broken, or only confirm that it ran?
+6. **Operability.** Logging at the right level without secrets or personal data,
+   metrics, timeouts, behaviour when a dependency is down.
+7. **Naming and comments.** Read the change once more for what it says rather than
+   what it does: every new or changed name; every comment, Javadoc and log or
+   exception message inside or next to a changed hunk; and descriptions elsewhere of
+   the behaviour that changed. Is each one true, and still true after this change?
+   A comment that contradicts the code may mean the code is the wrong one, so decide
+   which before reporting.
+8. **Maintainability.** Last and lightest: duplication of existing helpers, a layer
+   boundary crossed, dead code. Skip anything a formatter or linter settles.
+
+### 6. Verify before reporting
+
+- If you can run commands and the project has a wrapper (`./mvnw`, `./gradlew`),
+  compile and run the tests for the touched modules. Ask first if the suite looks
+  slow or needs external services. Never run goals that publish, deploy or change
+  data. Report the outcome, or state that tests were not run.
+- Re-read each finding against the code and ask: what concrete input or sequence of
+  events makes this fail? If you can name it, write it into the finding. If you
+  cannot, check once more whether something elsewhere (a validator, a constraint, a
+  filter, a global handler) already prevents it. Still unsure: move it to questions.
+- Drop findings that repeat each other; report the root cause once and list the other
+  locations.
+
+A false alarm costs more than it seems: the author spends time disproving it and then
+trusts the rest of the report less.
+
+### 7. Write the report
+
+Write in the language the user writes in. The template below is in Russian; translate
+the headings if the user uses another language. Keep code identifiers, annotations
+and file paths as they are.
+
+```markdown
+## Ревью: <ключ и название задачи или имя ветки>
+
+**Вердикт:** можно сливать | можно сливать после правок | нужны доработки
+**Объём:** <N> файлов, +<A>/−<D>, база `<base>` (`<merge-base, 8 символов>`)
+**Кратко:** 2–3 предложения: что сделано и главный вывод ревью.
+
+### Соответствие задаче
+| Требование | Статус | Реализация | Тест |
+|---|---|---|---|
+| <критерий> | выполнено / частично / нет | `Файл.java:строка` | `ТестКласс#метод` или «нет» |
+
+Вне задачи: <изменения, которых задача не требовала, или «нет»>
+
+### Замечания
+
+#### Блокеры
+**1. <суть в одной строке>** (`path/to/File.java:42`)
+- Что не так: <в чём дефект>
+- Сценарий: <конкретный ввод или последовательность событий и что произойдёт>
+- Как исправить: <конкретное действие, при необходимости короткий фрагмент кода>
+
+#### Важные
+#### Мелкие
+#### Вопросы к автору
+
+### Тесты
+<что покрыто, чего не хватает, результат запуска или «не запускались»>
+
+### Что не проверялось
+<что осталось за рамками и почему: не было описания задачи, не запускались тесты,
+часть кода просмотрена бегло, поведение зависит от настроек окружения>
+```
+
+Rules for the report:
+
+- Omit empty sections, except "Что не проверялось": the author needs to know where
+  the review stops.
+- Number findings continuously so the author can refer to them.
+- One finding, one problem. Start with the consequence, not with the rule that was
+  broken: "заказ спишется дважды при повторной доставке сообщения", not "нарушена
+  идемпотентность".
+- Minor naming and comment remarks go into a single finding "Именование и
+  комментарии" as a list of `файл:строка — что не так → предлагаемое имя или текст`,
+  so they do not bury the important findings. Always propose the concrete name or
+  text. A misleading name or comment that would lead someone into a bug gets its own
+  finding.
+- No praise padding and no retelling of the diff. One sentence on what is done well
+  is fine when it is specific and true.
+
+## Severity and verdict
+
+| Level | Meaning | Examples |
+|---|---|---|
+| Блокер | Wrong behaviour, data loss or corruption, a security hole, an outage, an unmet acceptance criterion, or a breaking change with no migration path | lost update under concurrency; endpoint without authorization; edited an already applied migration |
+| Важное | Likely to fail under realistic conditions, or core logic left unverified, or documentation that will mislead callers | N+1 on a list endpoint; no timeout on a remote call; main branch of logic has no test; Javadoc of a public method promises `null` where the code throws; `getX()` that writes to the database |
+| Мелкое | Local improvement, low risk if ignored | vague local name; stale local comment; commented-out code; duplicated helper; log level |
+| Вопрос | Cannot be decided from the code alone | "is this endpoint meant to be public?" |
+
+Verdict: any blocker means "нужны доработки"; important findings without blockers
+mean "можно сливать после правок"; otherwise "можно сливать".
+
+Calibrate honestly. Severity is about consequence, not about how confident or how
+clever the finding is. A report where everything is a blocker is as useless as one
+where nothing is. If the change is good, a short report that says so is the correct
+output; do not invent findings to fill the template.
